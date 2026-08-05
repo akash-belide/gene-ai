@@ -8,16 +8,23 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
+    "postinstall": "prisma generate",
     "db:seed": "tsx --conditions=react-server scripts/seed-knowledge.ts"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.9.1",
     "@prisma/client": "^7.9.1",
+    "@upstash/ratelimit": "^2.0.8",
+    "@upstash/redis": "^1.38.2",
     "next": "16.3.0",
     "openai": "^6.49.0",
     "pg": "^8.22.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
+    "react-markdown": "^10.1.0",
     "server-only": "^0.0.1"
   },
   "devDependencies": {

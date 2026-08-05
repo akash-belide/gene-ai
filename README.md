@@ -14,11 +14,29 @@ pnpm dev
 bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) with your browser to see the result. The Gene chat interface lives at [http://localhost:3000/gene](http://localhost:3000/gene).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Local environment
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Copy `.env.example` to `.env` and fill in the values (never commit `.env`):
+
+- `DATABASE_URL` — Supabase pooled connection (runtime).
+- `OPENAI_API_KEY`, `OPENAI_CHAT_MODEL` — OpenAI access; `OPENAI_EMBEDDING_MODEL` defaults to `text-embedding-3-small`.
+- `GENE_MINIMUM_SIMILARITY` — retrieval threshold (defaults to `0.45`).
+- `GENE_PUBLIC_ENABLED` — leave `false` locally; the chat route runs in development regardless.
+- `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` — optional locally (rate limiting is skipped without them), required in production.
+- `MIGRATION_DATABASE_URL` — manual migrations only; not used at app runtime.
+
+In development, `POST /api/gene/chat` runs without Upstash. In production it is
+served only when `GENE_PUBLIC_ENABLED=true` and requires Upstash rate limiting.
+
+## Deployment
+
+Gene AI deploys to Vercel using standard Next.js conventions (no `vercel.json`,
+build command `npm run build`, Node 22.x). Migrations never run on Vercel.
+
+- [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md) — step-by-step Vercel deployment and the required environment variables.
+- [`docs/PORTFOLIO_INTEGRATION.md`](./docs/PORTFOLIO_INTEGRATION.md) — linking Gene from the separate static portfolio.
 
 ## Learn More
 

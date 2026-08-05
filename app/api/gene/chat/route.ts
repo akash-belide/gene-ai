@@ -1,6 +1,7 @@
 import { generateEmbedding, getChatModel, getOpenAIClient } from "@/lib/openai";
 import { searchKnowledgeChunks } from "@/lib/knowledge";
-import { GENE_SYSTEM_PROMPT, NO_CONTEXT_ANSWER } from "@/lib/gene-prompt";
+import { GENE_SYSTEM_PROMPT } from "@/lib/gene-prompt";
+import { NO_CONTEXT_ANSWER, isRefusalAnswer } from "@/lib/gene-constants";
 import {
   MAX_LIMIT,
   dedupeById,
@@ -10,9 +11,16 @@ import {
   validateChatRequest,
 } from "@/lib/gene-context";
 import { inferSourceTypes } from "@/lib/gene-intent";
+import {
+  isGeneChatRouteAllowed,
+  isProduction,
+  validateGenePublicEnv,
+} from "@/lib/env";
+import { enforceGeneChatRateLimit } from "@/lib/gene-rate-limit";
 
 // This route runs database + OpenAI calls, so it must use the Node.js runtime
-// and always execute at request time.
+// (Prisma + pg + OpenAI are incompatible with the Edge runtime) and always
+// execute at request time.
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -20,6 +28,28 @@ const MAX_OUTPUT_TOKENS = 500;
 // Retrieve a slightly larger candidate pool than requested so multiple inferred
 // source types can each contribute before we trim to the requested limit.
 const MAX_CANDIDATE_POOL = 20;
+
+// Generic, user-safe messages. Internal causes are only ever logged, never
+// returned to the client.
+const UNAVAILABLE_MESSAGE = "Gene is temporarily unavailable. Please try again later.";
+const RATE_LIMIT_MESSAGE =
+  "Gene has received too many questions. Please try again in a few minutes.";
+
+/**
+ * Builds a chat response with `Cache-Control: no-store` applied to every path
+ * (success, refusal, validation errors, rate limits, server errors) so chat
+ * answers are never cached by a CDN or the browser.
+ */
+function chatResponse(
+  body: unknown,
+  status = 200,
+  extraHeaders?: Record<string, string>,
+): Response {
+  return Response.json(body, {
+    status,
+    headers: { "Cache-Control": "no-store", ...extraHeaders },
+  });
+}
 
 /**
  * Gene conversational endpoint (grounded RAG answer).
@@ -35,37 +65,71 @@ const MAX_CANDIDATE_POOL = 20;
  * Public callers only need `message`; likely source types are inferred by the
  * deterministic intent router.
  *
- * SECURITY: This endpoint is development-only (returns 404 in production),
- * matching POST /api/gene/search. Before this is exposed publicly, it MUST get
- * rate limiting, abuse/spend protection, and production access control
- * (e.g. auth or an allowlist). Do not remove the production guard without them.
+ * ACCESS: development always; production only when GENE_PUBLIC_ENABLED=true.
+ * When public, production requires rate-limit configuration (Upstash) and fails
+ * closed (503) otherwise. Model selection and system prompts are never accepted
+ * from the browser.
  */
 export async function POST(request: Request): Promise<Response> {
-  const isProduction = process.env.NODE_ENV === "production";
+  const production = isProduction();
 
-  if (isProduction) {
-    return Response.json({ error: "Not found" }, { status: 404 });
+  // 1. Access flag. In production the route only exists when explicitly enabled.
+  if (!isGeneChatRouteAllowed()) {
+    return chatResponse({ error: "Not found" }, 404);
   }
 
+  // 2. Production runtime configuration must be complete before serving public
+  //    traffic. We log only variable NAMES, never their values.
+  if (production) {
+    const envCheck = validateGenePublicEnv();
+    if (!envCheck.ok) {
+      console.error(
+        `[/api/gene/chat] missing required configuration: ${envCheck.missing.join(", ")}`,
+      );
+      return chatResponse({ error: UNAVAILABLE_MESSAGE }, 503);
+    }
+  }
+
+  // 3. Parse + validate before rate limiting so malformed requests are rejected
+  //    cheaply and do not consume a request's rate-limit budget unnecessarily.
   let body: unknown;
   try {
     body = await request.json();
   } catch {
-    return Response.json(
+    return chatResponse(
       { error: "Request body must be valid JSON." },
-      { status: 400 },
+      400,
     );
   }
 
   const validation = validateChatRequest(body);
   if (!validation.ok) {
-    return Response.json({ error: validation.error }, { status: 400 });
+    return chatResponse({ error: validation.error }, 400);
   }
 
   const { message, sourceType, limit, minimumSimilarity } = validation.data;
 
-  // Resolve server configuration first so we fail fast (before any paid API
-  // call) if the deployment is misconfigured.
+  // 4. Rate limit BEFORE any paid OpenAI call (embedding or generation). In
+  //    production a missing limiter fails closed; in development it is skipped.
+  const rateLimit = await enforceGeneChatRateLimit(request, {
+    isProduction: production,
+  });
+
+  if (rateLimit.status === "unconfigured") {
+    console.error(
+      "[/api/gene/chat] rate limiting is not configured; refusing to serve public traffic",
+    );
+    return chatResponse({ error: UNAVAILABLE_MESSAGE }, 503);
+  }
+
+  if (rateLimit.status === "limited") {
+    return chatResponse({ error: RATE_LIMIT_MESSAGE }, 429, {
+      "Retry-After": String(rateLimit.retryAfterSeconds),
+    });
+  }
+
+  // 5. Resolve server configuration so we fail fast (before any paid API call)
+  //    if the deployment is misconfigured.
   let openai;
   let chatModel: string;
   try {
@@ -73,9 +137,9 @@ export async function POST(request: Request): Promise<Response> {
     chatModel = getChatModel();
   } catch (error) {
     console.error("[/api/gene/chat] configuration error:", error);
-    return Response.json(
+    return chatResponse(
       { error: "The chat service is not configured correctly." },
-      { status: 500 },
+      500,
     );
   }
 
@@ -84,16 +148,14 @@ export async function POST(request: Request): Promise<Response> {
   // 2. Otherwise infer likely source types from the question.
   // 3. If none inferred, search unfiltered.
   const inferredSourceTypes = inferSourceTypes(message);
-  const appliedSourceTypes = sourceType
-    ? [sourceType]
-    : inferredSourceTypes;
+  const appliedSourceTypes = sourceType ? [sourceType] : inferredSourceTypes;
 
   // Threshold: env default, with a dev-only per-request override.
   const baseMinimumSimilarity = parseMinimumSimilarityEnv(
     process.env.GENE_MINIMUM_SIMILARITY,
   );
   const effectiveMinimumSimilarity =
-    !isProduction && minimumSimilarity !== undefined
+    !production && minimumSimilarity !== undefined
       ? minimumSimilarity
       : baseMinimumSimilarity;
 
@@ -119,25 +181,27 @@ export async function POST(request: Request): Promise<Response> {
       .slice(0, limit);
   } catch (error) {
     console.error("[/api/gene/chat] retrieval failed:", error);
-    return Response.json(
+    return chatResponse(
       { error: "Failed to retrieve information for your question." },
-      { status: 500 },
+      500,
     );
   }
 
-  // Retrieval metadata for development visibility. This must be removed or
-  // gated before the endpoint is exposed publicly.
-  const retrieval = {
-    inferredSourceTypes,
-    appliedSourceTypes,
-    minimumSimilarity: effectiveMinimumSimilarity,
-  };
+  // Retrieval metadata is development-only debugging visibility. It is never
+  // included in production responses.
+  const retrieval = production
+    ? undefined
+    : {
+        inferredSourceTypes,
+        appliedSourceTypes,
+        minimumSimilarity: effectiveMinimumSimilarity,
+      };
 
   // No verified context survived the threshold -> do not call the chat model.
   if (results.length === 0) {
-    return Response.json({
+    return chatResponse({
       answer: NO_CONTEXT_ANSWER,
-      retrieval,
+      ...(retrieval ? { retrieval } : {}),
       sources: [],
     });
   }
@@ -160,23 +224,27 @@ export async function POST(request: Request): Promise<Response> {
     answer = response.output_text?.trim() ?? "";
   } catch (error) {
     console.error("[/api/gene/chat] OpenAI Responses API error:", error);
-    return Response.json(
+    return chatResponse(
       { error: "The assistant is temporarily unavailable." },
-      { status: 502 },
+      502,
     );
   }
 
   if (answer.length === 0) {
     console.error("[/api/gene/chat] OpenAI returned an empty answer.");
-    return Response.json(
+    return chatResponse(
       { error: "The assistant returned an empty response." },
-      { status: 502 },
+      502,
     );
   }
 
-  return Response.json({
+  // If the model produced the canonical refusal, do not attach sources: the
+  // retrieved chunks did not actually support an answer.
+  const sources = isRefusalAnswer(answer) ? [] : toSourceSummaries(results);
+
+  return chatResponse({
     answer,
-    retrieval,
-    sources: toSourceSummaries(results),
+    ...(retrieval ? { retrieval } : {}),
+    sources,
   });
 }

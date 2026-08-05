@@ -1,5 +1,7 @@
 import "server-only";
 
+export { NO_CONTEXT_ANSWER } from "@/lib/gene-constants";
+
 /**
  * System instructions for "Gene", Akash Belide's portfolio assistant.
  *
@@ -32,10 +34,3 @@ Rules:
 16. Do not ask the visitor whether they want another summary.
 17. When listing multiple roles or projects, use concise formatting.
 18. When the context contains multiple records needed for a complete answer, combine them without omitting relevant records.`;
-
-/**
- * The canonical fallback answer used when there is no verified context to
- * ground an answer. Kept here so the route and the model instructions agree.
- */
-export const NO_CONTEXT_ANSWER =
-  "I don't have enough verified information to answer that.";
